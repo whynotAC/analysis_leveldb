@@ -159,8 +159,53 @@ private:
     const bool owns_cache_;
     const std::string dbname_;
 
+    // talbe_cache_ provides its own synchronization
+    TableCache* const table_cache_;
 
+    // lock over the persistent DB state. Non-null iff successfully acquired.
+    FileLock* db_lock_;
+
+    // State below is protected by mutex_;
+    port::Mutex mutex_;
+    std::atomic<bool> shutting_down_;
+    port::CondVar background_work_finished_signal_ GUARDED_BY(mutex_);
+    MemTable* mem_;
+    MemTable* imm_ GUARDED_BY(mutex_);      // Memtable being compacted
+    std::atomic<bool> has_imm_;             // So bg thread can detect non-null imm_
+    WritableFile* logfile_;
+    uint64_t logfile_number_ GUARDED_BY(mutex_);
+    log::Writer* log_;
+    uint32_t seed_ GUARDED_BY(mutex_);      // For sampling.
+
+    // Queue of writers
+    std::deque<Writer*> writers_ GUARDED_BY(mutex_);
+    WriteBatch* tmp_batch_ GUARDED_BY(mutex_);
+
+    SnapshotList snapshots_ GUARDED_BY(mutex_);
+
+    // Set of table files to protect from deletion because they are
+    // part of ongoing compactions.
+    std::set<uint64_t> pending_outputs_ GUARDED_BY(mutex_);
+
+    // Has a background compaction been scheduled or is running?
+    bool background_compaction_scheduled_ GUARDED_BY(mutex_);
+
+    ManualCompaction* manual_compaction_ GUARDED_BY(mutex_);
+
+    VersionSet* const versions_;
+
+    // Have we encountered a background error in paranoid mode?
+    Status bg_error_ GUARDED_BY(mutex_);
+
+    CompactionStats stats_[config::kNumLevels] GUARDED_BY(mutex_);
 };
+
+// Sanitize db options. The caller should delete result.info_log if
+// it is not equal to src.info_log
+Options SanitizeOptions(const std::string& db,
+                        const InternalKeyComparator* icmp,
+                        const InternalFilterPolicy* ipolicy,
+                        const Options& src);
 
 } // namespace leveldb
 
