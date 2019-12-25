@@ -246,10 +246,244 @@ void DBImpl::DeleteObsoleteFiles() {
                     // (in case these is a race that allows other incarnations)
                     keep = (number >= versions_->ManifestFileNumber());
                     break;
-                case  
+                case kTableFile:
+                    keep = (live.find(number) != live.end());
+                    break;
+                case kTempFile:
+                    // Any temp files that are currently being written to must
+                    // be recorded in pending_outputs_, which is inserted into
+                    // "live"
+                    keep = (live.find(number) != live.end());
+                    break;
+                case kCurrentFile:
+                case kDBLockFile:
+                case kInfoLogFile:
+                    keep = true;
+                    break;
+            }
+
+            if (!keep) {
+                if (type == kTableFile) {
+                    table_cache_->Evict(number);
+                }
+                Log(options_.info_log, "Delete type=%d #%lld\n", static_cast<int>(type),
+                        static_cast<unsigned long long>(number));
+                env_->DeleteFile(dbname_ + "/" + filenames[i]);
             }
         }
     }
 }
+
+Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
+    mutex_.AssertHeld();
+
+    // Ignore error from CreateDir since the creation of the DB is
+    // committed only when the descriptor is created, and this directory
+    // may already exists from a previous failed creation attempt.
+    env_->CreateDir(dbname_);
+    assert(db_lock_ == nullptr);
+    Status s = env_->LockFile(LockFileName(dbname_), &db_lock_);
+    if (!s.ok()) {
+        return s;
+    }
+
+    if (!env_->FileExists(CurrentFileName(dbname_))) {
+        if (options_.create_if_missing) {
+            s = NewDB();
+            if (!s.ok()) {
+                return s;
+            }
+        } else {
+            return Status::InvalidArgument(
+                    dbname_, "does not exist (create_if_missing is false)");
+        }
+    } else {
+        if (options_.error_if_exists) {
+            return Status::InvalidArgument(dbname_,
+                                            "exists (error_if_exists is true)");
+        }
+    }
+
+    s = versions_->Recover(save_manifest);
+    if (!s.ok()) {
+        return s;
+    }
+    SequenceNumber max_sequence(0);
+
+    // Recover from all newer log  files than the ones named in the
+    // descriptor (new log files may have been added by the previous
+    // incarnation without registering them in the descriptor).
+    //
+    // Note that PrevLogNumber() is no longer used, but we pay
+    // attention to it in case we are recovering a database
+    // produced by an older version of leveldb.
+    const uint64_t min_log = versions_->LogNumber();
+    const uint64_t prev_log = versions_->PrevLogNumber();
+    std::vector<std::string> filenames;
+    s = env_->GetChildren(dbname_, &filenames);
+    if (!s.ok()) {
+        return s;
+    }
+    std::set<uint64_t> expected;
+    versions_->AddLiveFiles(&expected);
+    uint64_t number;
+    FileType type;
+    std::vector<uint64_t> logs;
+    for (size_t i = 0; i < filenames.size(); i++) {
+        if (ParseFileName(filenames[i], &number, &type)) {
+            expected.erase(number);
+            if (type == kLogFile && ((number >= min_log) || (number == prev_log)))
+                logs.push_back(number);
+        }
+    }
+    if (!expected.empty()) {
+        char buf[50];
+        snprintf(buf, sizeof(buf), "%d missing files; e.g.",
+                    static_cast<int>(expected.size()));
+        return Status::Corruption(buf, TableFileName(dbname_, *(expected.begin())));
+    }
+
+    // Recover in the order in which the logs were generated.
+    std::sort(logs.begin(), logs.end());
+    for (size_t i = 0; i < logs.size(); i++) {
+        s = RecoverLogFile(logs[i], (i == logs.size() - 1), save_manifest, edit,
+                            &max_sequence);
+        if (!s.ok()) {
+            return s;
+        }
+        
+        // The previous incarnation may not have written any MANIFEST
+        // records after allocating this log number. So we manually
+        // update the file number allocation counter int VersionSet.
+        versions_->MarkFileNumberUsed(logs[i]);
+    }
+
+    if (versions_->LastSequence() < max_sequence) {
+        versions_->SetLastSequence(max_sequence);
+    }
+
+    return Status::OK();
+}
+
+Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
+                                bool* save_manifest, VersionEdit* edit,
+                                SequenceNumber* max_sequence) {
+    struct LogReporter : public log::Reader::Reporter {
+        Env* env;
+        Logger* info_log;
+        const char* fname;
+        Status* status;     // null if options_.paranoid_checks==false
+        virtual void Corruption(size_t bytes, const Status& s) {
+            Log(info_log, "%s%s: dropping %d bytes; %s",
+                (this->status == nullptr ? "(ignoring error) " : ""), fname,
+                static_cast<int>(bytes), s.ToString().c_str());
+            if (this->status != nullptr && this->status->ok()) *this->status = s;
+        }
+    };
+
+    mutex_.AssertHeld();
+
+    // Open the log file
+    std::string fname = LogFileName(dbname_, log_number);
+    SequentialFile* file;
+    Status status = env_->NewSequentialFile(fname, &file);
+    if (!status.ok()) {
+        MaybeIgnoreError(&status);
+        return status;
+    }
+
+    // Create the log reader.
+    LogReporter reporter;
+    reporter.env = env_;
+    reporter.info_log = options_.info_log;
+    reporter.fname = fname.c_str();
+    reporter.status = (options_.paranoid_checks ? &status : nullptr);
+    // We intentionally make log::Reader do checksumming even if
+    // paranoid_checks==false so that corruptions cause entire commits
+    // to be skipped instead of propagating bad information (like overly
+    // large sequence number).
+    log::Reader reader(file, &reporter, true /*checksum*/, 0 /*initial_offset*/);
+    Log(options_.info_log, "Recovering log #%llu",
+            (unsigned long long)log_number);
+
+    // Read all the records and add to a memtable
+    std::string scratch;
+    Slice record;
+    WriteBatch batch;
+    int compactions = 0;
+    MemTable* mem = nullptr;
+    while (reader.ReadRecord(&record, &scratch) && status.ok()) {
+        if (record.size() < 12) {
+            reporter.Corruption(record.size(),
+                                Status::Corruption("log record too small"));
+            continue;
+        }
+        WriteBatchInternal::SetContents(&batch, record);
+
+        if (mem == nullptr) {
+            mem = new MemTable(internal_comparator_);
+            mem->Ref();
+        }
+        status = WriteBatchInternal::InsertInto(&batch, mem);
+        MaybeIgnoreError(&status);
+        if (!status.ok()) {
+            break;
+        }
+        const SequenceNumber last_seq = WriteBatchInternal::Sequence(&batch) +
+                                        WriteBatchInternal::Count(&batch) - 1;
+        if (last_seq > *max_sequence) {
+            *max_sequence = last_seq;
+        }
+
+        if (mem->ApproximateMemoryUsage() > options_.write_buffer_size) {
+            compactions++;
+            *save_manifest = true;
+            status = WriteLevel0Table(mem, edit, nullptr);
+            mem->Unref();
+            mem = nullptr;
+            if (!status.ok()) {
+                // Reflect errors immediately so that conditions like full
+                // file-systems cause the DB::Open() to fail.
+                break;
+            }
+        }
+    }
+
+    delete file;
+
+    // See if we should keep reusing the last log file.
+    if (status.ok() && options_.reuse_logs && last_log && compations == 0) {
+        assert(logfile_ == nullptr);
+        assert(log_ == nullptr);
+        assert(mem_ == nullptr);
+        uint64_t lfile_size;
+        if (env_->GetFileSize(fname, &lfile_size).ok() &&
+                env_->NewAppendableFile(fname, &logfile_).ok()) {
+            Log(options_.info_log, "Reusing old log %s \n", fname.c_str());
+            log_ = new log::Writer(logfile_, lfile_size);
+            logfile_number_ = log_number;
+            if (mem != nullptr) {
+                mem_ = mem;
+                mem = nullptr;
+            } else {
+                // mem can be nullptr if lognum exists but was empty.
+                mem_ = new MemTable(internal_comparator_);
+                mem_->Ref();
+            }
+        }
+    }
+
+    if (mem != nullptr) {
+        // mem did not get reused; compact it.
+        if (status.ok()) {
+            *save_manifest = true;
+            status = WriteLevel0Table(mem, edit, nullptr);
+        }
+        mem->Unref();
+    }
+
+    return status;
+}
+
 
 } // namespace leveldb
