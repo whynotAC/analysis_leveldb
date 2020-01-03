@@ -250,7 +250,19 @@ struct Saver {
 };
 } // namespace
 static void SaveValue(void* arg, const Slice& ikey, const Slice& v) {
-    
+    Saver* s = reinterpret_cast<Saver*>(arg);
+    ParsedInternalKey parsed_key;
+    if (!ParseInternalKey(ikey, &parsed_key)) {
+        s->state = kCorrupt;
+    } else {
+        if (s->ucmp->Compare(parsed_key.user_key, s->user_key) == 0) {
+            s->state = (parsed_key.type == kTypeValue) ? kFound : kDeleted;
+            if (s->state == kFound) {
+                s->value->assign(v.data(), v.size());
+            }
+        }
+    }
 }
 
+static bool 
 } // namespace leveldb
