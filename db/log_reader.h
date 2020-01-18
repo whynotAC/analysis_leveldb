@@ -74,11 +74,36 @@ class Reader {
     // Returns true on success. Handles reporting.
     bool SkipToInitialBlock();
 
+    // Return type. or one of the preceding special values
+    unsigned int ReadPhysicalRecord(Slice* result);
 
+    // Reports dropped bytes to the reporter.
+    // buffer_ must be updated to remove the dropped bytes prior to invocation.
+    void ReportCorruption(uint64_t bytes, const char* reason);
+    void ReportDrop(uint64_t bytes, const Status& reason);
+
+    SequentialFile* const file_;
+    Reporter* const reporter_;
+    bool const checksum_;
+    char* const backing_store_;
+    Slice buffer_;
+    bool eof_;  // Last Read() indicated EOF by retruning < kBlockSize
+
+    // Offset of the last record returned by ReadRecord.
+    uint64_t last_record_offset_;
+    // Offset of the first location past the end of buffer_;
+    uint64_t end_of_buffer_offset_;
+
+    // Offset at which to start looking for the first record to return
+    uint64_t const initial_offset_;
+
+    // True if we are resynchronizing after a seek (initial_offset_ > 0). In
+    // particular, a run of kMiddleType and kLastType records can be silently
+    // skipped in this mode
+    bool resyncing_;
 };
 
 } // namespace log
-
 } // namespace leveldb
 
 #endif
