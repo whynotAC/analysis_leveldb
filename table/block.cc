@@ -134,7 +134,129 @@ class Block::Iter : public Iterator {
         assert(Valid());
         ParseNextKey();
     }
+    
+    virtual void Prev() {
+        assert(Valid());
 
+        // Scan backwards to a restart point before current_
+        const uint32_t original = current_;
+        while (GetRestartPoint(restart_index_) >= original) {
+            if (restart_index_ == 0) {
+                // No more entries
+                current_ = restarts_;
+                restart_index_ = num_restarts_;
+                return;
+            }
+            restart_index_--;
+        }
+
+        SeekToRestartPoint(restart_index_);
+        do {
+            // Loop until end of current entry hits the start of original entry
+        } while (ParseNextKey() && NextEntryOffset() < original);
+    }
+
+    virtual void Seek(const Slice& target) {
+        // Binary search in restart array to find the last restart point
+        // with a key < target
+        uint32_t left = 0;
+        uint32_t right = num_restarts_ - 1;
+        while (left < right) {
+            uint32_t mid = (left + right + 1) / 2;
+            uint32_t region_offset = GetRestartPoint(mid);
+            uint32_t shared, non_shared, value_length;
+            const char* key_ptr = 
+                DecodeEntry(data_ + region_offset, data_ + restarts_, &shared,
+                                &non_shared, &value_length);
+            if (key_ptr == nullptr || (shared != 0)) {
+                CorruptionError();
+                return;
+            }
+            Slice mid_key(key_ptr, non_shared);
+            if (Compare(mid_key, target) < 0) {
+                // Key at "mid" is smaller than "target". Therefore all
+                // blocks before "mid" are uninteresting
+                left = mid;
+            } else {
+                // Key at "mid" is >= "target". Therefore all blocks at or
+                // after "mid" are uninteresting.
+                right = mid - 1;
+            }
+        }
+
+        // Linear search (within restart block) for first key >= target
+        SeekToRestartPoint(left);
+        while (true) {
+            if (!ParseNextKey()) {
+                return;
+            }
+            if (Compare(key_, target) >= 0) {
+                return;
+            }
+        }
+    }
+    
+    virtual void SeekToFirst() {
+        SeekToRestartPoint(0);
+        ParseNextKey();
+    }
+
+    virtual void SeekToLast() {
+        SeekToRestartPoint(num_restarts_ - 1);
+        while (ParseNextKey() && NextEntryOffset() < restarts_) {
+            // Keep skipping
+        }
+    }
+
+  private:
+    void CorruptionError() {
+        current_ = restarts_;
+        restart_index_ = num_restarts_;
+        status_ = Status::Corruption("bad entry in block");
+        key_.clear();
+        value_.clear();
+    }
+
+    bool ParseNextKey() {
+        current_ = NextEntryOffset();
+        const char* p = data_ + current_;
+        const char* limit = data_ + restarts_;  // Restarts come right after data
+        if (p >= limit) {
+            // No more entries to return, Mark as invalid
+            current_ = restarts_;
+            restart_index_ = num_restarts_;
+            return false;
+        }
+
+        // Decode next entry
+        uint32_t shared, non_shared, value_length;
+        p = DecodeEntry(p, limit, &shared, &non_shared, &value_length);
+        if (p == nullptr || key_.size() < shared) {
+            CorruptionError();
+            return false;
+        } else {
+            key_.resize(shared);
+            key_.append(p, non_shared);
+            value_ = Slice(p + non_shared, value_length);
+            while (restart_index_ + 1 < num_restarts_ && 
+                    GetRestartPoint(restart_index_ + 1) < current_) {
+                ++restart_index_;
+            }
+            return true;
+        }
+    }
 };
+
+Iterator* Block::NewIterator(const Comparator* comparator) {
+    if (size_ < sizeof(uint32_t)) {
+        return NewErrorIterator(Status::Corruption("bad block contents"));
+    }
+    const uint32_t num_restarts = NumRestarts();
+    if (num_restarts == 0) {
+        return NewEmptyIterator();
+    } else {
+        return new Iter(comparator, data_, restart_offset_, num_restarts);
+    }
+}
 
 } // namespace leveldb
